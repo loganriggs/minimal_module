@@ -10,9 +10,27 @@ from sklearn.model_selection import train_test_split
 from GaussianNoise import GaussianNoise
 from copy import deepcopy
 import matplotlib.pyplot as plt
-from GumbalMask import GumbalMask
+from GumbalMaskWeights import GumbalMaskWeights
 from mask_zero_one import gumbal
+from torch.nn import functional as F
 from matplotlib import colors
+
+
+
+class GumbalWeightMask(nn.Module):
+    def __init__(self, shape):
+        super().__init__()
+        self.fc1 = GumbalMaskWeights(shape[0], shape[1])
+        self.fc2 = GumbalMaskWeights(shape[1], shape[1])
+        self.fc3 = GumbalMaskWeights(shape[1], shape[2])
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.fc2(x)
+        x = F.relu(x)
+        output = self.fc3(x)
+        return output
 
 def modify_parameters(mask, model):
     index = 0
@@ -31,9 +49,9 @@ def train(args, model, train_loader, optimizer, epoch):
         optimizer.zero_grad()
         output = model(data)
         loss = nn.L1Loss()(output, target)
-        alpha = 100
-        loss += alpha * sum([module.precisionlog.exp().sum()
-                     for module in model if isinstance(module, GaussianNoise)])
+        alpha = 0.001
+        loss += alpha * sum([weights_layer.exp().sum()
+                     for name, weights_layer in model.named_parameters() if "logits" in name])
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
@@ -48,7 +66,8 @@ def test(model, test_loader):
     with torch.no_grad():
         test_loss = torch.mean(torch.stack([torch.mean(nn.L1Loss()(model(data), target)) for data, target in test_loader]))
         print('\nTest set: Average loss: {:.4f}\n'.format(
-            test_loss)) #TODO change 1000 to the batch size
+            test_loss))
+    return test_loss
 
 def print_examples(model, test_loader):
     model.eval()
@@ -76,9 +95,10 @@ def print_variance(model):
 def precision_parameter_to_list(model):
     precision_list = []
     for name, param in model.named_parameters():
-        if "precisionlog" in name:
+        if "logit" in name:
             precision_list.append(param.cpu().detach().clone())
     return precision_list
+
 
 def train_test(args, optimizer, model, train_loader, test_loader):
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
@@ -112,7 +132,7 @@ parser.add_argument('--dry-run', action='store_true', default=False,
                     help='quickly check a single pass')
 parser.add_argument('--seed', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
-parser.add_argument('--log-interval', type=int, default=100, metavar='N',
+parser.add_argument('--log-interval', type=int, default=500, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--save-model', action='store_true', default=False,
                     help='For Saving the current Model')
@@ -122,24 +142,16 @@ args = parser.parse_args()
 use_cuda = not args.no_cuda and torch.cuda.is_available()
 
 
-quick_run = True
-full_run = True
-debug_run = False
-if(quick_run):
+run = 2
+if(run == 0): #Quick run
     args.epochs = 1
     num_workers = 1
-if(full_run):
-    args.epochs = 10
-    num_workers = 2
-if(debug_run):
+elif(run == 1): #Debug run
     args.epochs = 1
     num_workers = 0
-
-datatype = 0
-if(datatype == 0): #Single add or mult
-    data_name = "add_mult_single"
-else: # Both add_mult and mult_add
-    data_name = "add_mult"
+else: #Full Run
+    args.epochs = 20
+    num_workers = 1
 
 # torch.manual_seed(args.seed)
 
@@ -160,45 +172,47 @@ transform=transforms.Compose([
     transforms.Normalize((0.1307,), (0.3081,))
     ])
 
+
+loss_results = np.zeros(6)
+datatype = 1
+if(datatype == 0): #Single add or mult
+    data_name = "add_mult_single"
+else: # Both add_mult and mult_add
+    data_name = "add_mult"
+
 mult_add = np.load(data_name + "_data.npy")
 mult_add_labels = np.load(data_name + "_labels.npy")
 input_output_shape = [mult_add.shape[1], mult_add_labels.shape[1]]
 mult_add = torch.Tensor(mult_add)
 mult_add_labels = torch.Tensor(mult_add_labels)
 
+
 train_dataset, test_dataset = train_test_dataset_maker(mult_add, mult_add_labels, test_percent = 0.3)
 train_loader = torch.utils.data.DataLoader(train_dataset,**train_kwargs)
 test_loader  = torch.utils.data.DataLoader(test_dataset, **test_kwargs)
 
-nn_size = 400
-model = nn.Sequential(
-    # GumbalMask(input_output_shape[0]),
-    nn.Linear(input_output_shape[0], nn_size),
-    GaussianNoise(nn_size),
-    nn.ReLU(),
-    nn.Linear(nn_size, nn_size),
-    GaussianNoise(nn_size),
-    nn.ReLU(),
-    nn.Linear(nn_size, input_output_shape[1]),
-    # GumbalMask(input_output_shape[1])
-    )
+
+networkShape = [input_output_shape[0], 400, input_output_shape[1]]
+model = GumbalWeightMask(networkShape)
+
 
 print("Beginning\n=================================")
-print_variance(model)
-# torch.ones_like(model.parameters())
 
 optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
 train_test(args, optimizer, model, train_loader, test_loader)
+print("Original Training\n=====================================\n")
+print_examples(model, test_loader)
 precision_original = precision_parameter_to_list(model)
 
+#This may not work: try
 # Set gradient False for all layers (except GN)
 for name, param in model.named_parameters():
-    if "precisionlog" not in name:
+    if "logits" not in name:
         param.requires_grad = False
 
 # Create subset datasets
-# add_mult - first hmult_add_only_labelsalf
+# add_mult - first half
 # mult_add - second half
 half_index = mult_add.shape[0]//2
 add_mult_only = mult_add[:half_index,:]
@@ -206,14 +220,6 @@ mult_add_only = mult_add[half_index:, :]
 
 add_mult_only_labels = mult_add_labels[:half_index]
 mult_add_only_labels = mult_add_labels[half_index:]
-
-#Make copy of model to test if the deepcopy effects things?
-#After run, check the requires_grad flag on both model and original_model
-#Get prediction loss on sub-datasets
-#Currently, they are still performing well on both subsets
-#Why is it slow? Cause the computer just came on?
-
-#TODO: Convert test loss into meaningful l1 distance of each example on average
 
 #Create data_loaders
 train_dataset_mult_add, test_dataset_mult_add = train_test_dataset_maker(mult_add_only, mult_add_only_labels, test_percent = 0.3)
@@ -226,47 +232,56 @@ test_loader_add_mult = torch.utils.data.DataLoader(test_dataset_add_mult, **test
 
 #Create deep copy of model
 original_model = deepcopy(model)
-print("Original Examples")
-print_examples(model, test_loader)
 
+#Test original Model loss
+loss_results[0] = test(model, test_loader_mult_add)
+loss_results[1] = test(model, test_loader_add_mult)
+
+
+#Reset optimizer learning rate
 optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
 #Train add_mult
 train_test(args, optimizer, model, train_loader_add_mult, test_loader_add_mult)
 precision_add_mult = precision_parameter_to_list(model)
-print("Add-Mult should be low")
+print("Only add_mult: 0 , 1 should do well")
 print_examples(model, test_loader)
+print("Add_Mult should be lower loss")
 print("Mult_add Loss: ")
-test(model, test_loader_mult_add)
+loss_results[2] = test(model, test_loader_mult_add)
 print("Add_Mult Loss")
-test(model, test_loader_add_mult)
+loss_results[3] = test(model, test_loader_add_mult)
+
 
 #Re-point optimzer to the original_model
-optimizer = optim.Adadelta(original_model.parameters(), lr=args.lr)
+optimizer_new = optim.Adadelta(original_model.parameters(), lr=args.lr)
 
 #Train mult_add
-train_test(args, optimizer, original_model, train_loader_mult_add, test_loader_mult_add)
+train_test(args, optimizer_new, original_model, train_loader_mult_add, test_loader_mult_add)
 precision_mult_add = precision_parameter_to_list(original_model)
-print("Mult_add should be low")
+print("Only mult: 1 , 0 should do well")
 print_examples(original_model, test_loader)
+print("Mult_Add should be lower loss")
 print("Mult_add Loss: ")
-test(original_model, test_loader_mult_add)
+loss_results[4] = test(original_model, test_loader_mult_add)
 print("Add_Mult Loss")
-test(original_model, test_loader_add_mult)
+loss_results[5] = test(original_model, test_loader_add_mult)
+
+
+print("====================Loss=================")
+print("Case        | Mult Add       | Add Mult")
+print("Original    | {0:.2f}         | {1:.2f}".format(loss_results[0], loss_results[1]))
+print("Add_Mult    | {0:.2f}         | {1:.2f}".format(loss_results[2], loss_results[3]))
+print("Mult_Add    | {0:.2f}         | {1:.2f}".format(loss_results[4], loss_results[5]))
 
 if args.save_model:
     torch.save(model.state_dict(), "mnist_cnn.pt")
 
-m = deepcopy(precision_original)
-a = deepcopy(precision_original)
-for x in range(2):
-    m[x] = precision_mult_add[x] - precision_original[x]
-    a[x] = precision_add_mult[x] - precision_original[x]
-    # plt.figure(x)
-    # plt.scatter(m[x], a[x])
-    # plt.title("Layer " + str(x))
+print("Just masks themselves")
+print("Layer |   Add %    |   Mult %  |   Add_size  |   Mult_size  | Original_size")
 
-for x in range(2):
+
+for x in range(6):
     average_weights_shared_add = 0
     average_weights_shared_mult = 0
     average_add_size = 0
@@ -277,19 +292,26 @@ for x in range(2):
     for n in range(N):
         add_mask = gumbal(precision_add_mult[x])
         mult_mask = gumbal(precision_mult_add[x])
-        add_mask_ind = torch.where(add_mask == 1)[0]
-        mult_mask_ind = torch.where(mult_mask == 1)[0]
-        add_size = add_mask_ind.shape[0]
-        mult_size = mult_mask_ind.shape[0]
-        shared_size = len([1 for x,y in zip(add_mask, mult_mask) if x==1 and y == 1])
-        if(n ==0): #plot first mask
+        add_size = torch.count_nonzero(add_mask)
+        mult_size = torch.count_nonzero(mult_mask)
+        shared_size = torch.count_nonzero(add_mask*mult_mask)
+        if n == 0: #plot first mask
             encoding = add_mask + 2*mult_mask
-            encoding = encoding[None, :] #Extend dimension
+            if(encoding.shape.__len__() == 1):
+                encoding = encoding[None, :] #Extend dimension
             cmap = colors.ListedColormap(['black', 'blue', 'red', 'purple'])
             bounds = [0, 1, 2,3,4]
             norm = colors.BoundaryNorm(bounds, cmap.N)
             plt.figure(x)
-            im = plt.imshow(encoding, cmap=cmap, norm=norm, aspect = 60)
+            if x % 2 != 0: #odd is bias layer
+                aspect_size = 100
+            elif x == 0:
+                aspect_size = 5
+            elif x == 2:
+                aspect_size = 1
+            else:
+                aspect_size = 10
+            im = plt.imshow(encoding, cmap=cmap, norm=norm, aspect = aspect_size)
             plt.title("Layer " + str(x+1))
             plt.xlabel("Neuron")
             plt.ylabel("Similarity")
@@ -312,4 +334,5 @@ for x in range(2):
     average_add_size = average_add_size / N
     average_mult_size = average_mult_size / N
     average_original_size = average_original_size / N
-    print(x, " , ", average_weights_shared_add, ", ", average_weights_shared_mult, ", ", average_add_size, " | ", average_mult_size, " , ", average_original_size)
+    print(x, " , ", average_weights_shared_add, ", ", average_weights_shared_mult, ", ", average_add_size, " , ", average_mult_size, " , ", average_original_size)
+

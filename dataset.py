@@ -74,9 +74,16 @@ mult_add_labels = np.concatenate((mult_label, add_label), axis=0)
 add_mult_both = np.concatenate((add_mult, mult_add), axis=1)
 add_mult_both_labels = np.concatenate((add_mult_labels, mult_add_labels), axis=1)
 
+#Create just add and Mult
+add_mult_single = np.concatenate((add_mult[:3,:], add_mult[3:,:]), axis=1)
+add_mult_single_labels = np.concatenate((add_mult_labels[0:1,:], add_mult_labels[1:2,:]), axis=1)
+
 
 np.save("add_mult_data", add_mult_both.T)
 np.save("add_mult_labels", add_mult_both_labels.T)
+
+np.save("add_mult_single_data", add_mult_single.T)
+np.save("add_mult_single_labels", add_mult_single_labels.T)
 
 
 #Verification: Deprecated

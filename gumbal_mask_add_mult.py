@@ -31,9 +31,9 @@ def train(args, model, train_loader, optimizer, epoch):
         optimizer.zero_grad()
         output = model(data)
         loss = nn.L1Loss()(output, target)
-        alpha = 100
-        loss += alpha * sum([module.precisionlog.exp().sum()
-                     for module in model if isinstance(module, GaussianNoise)])
+        alpha = 1
+        loss += alpha /sum([module.logits.exp().sum()
+                     for module in model if isinstance(module, GumbalMask)])
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
@@ -48,7 +48,7 @@ def test(model, test_loader):
     with torch.no_grad():
         test_loss = torch.mean(torch.stack([torch.mean(nn.L1Loss()(model(data), target)) for data, target in test_loader]))
         print('\nTest set: Average loss: {:.4f}\n'.format(
-            test_loss)) #TODO change 1000 to the batch size
+            test_loss))
 
 def print_examples(model, test_loader):
     model.eval()
@@ -73,12 +73,20 @@ def print_variance(model):
         if "variance" in name:
             print(name, " : ", torch.mean(param).cpu().detach().numpy(), " | max: ", torch.max(param).cpu().detach().numpy(), " | min: ", torch.min(param).cpu().detach().numpy())
 
-def precision_parameter_to_list(model):
+def precision_parameter_to_list(model, parameter_name="precisionlog"):
     precision_list = []
     for name, param in model.named_parameters():
-        if "precisionlog" in name:
+        if parameter_name in name:
             precision_list.append(param.cpu().detach().clone())
     return precision_list
+
+# TODO: ummmmm..... do we return the mask (which is sampled every time (right?)) or do we run it a few times and average?s
+# def mask_parameter_to_list(model):
+#     precision_list = []
+#     for name, param in model.named_parameters():
+#         if "logits" in name:
+#             precision_list.append(param.cpu().detach().clone())
+#     return precision_list
 
 def train_test(args, optimizer, model, train_loader, test_loader):
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
@@ -112,7 +120,7 @@ parser.add_argument('--dry-run', action='store_true', default=False,
                     help='quickly check a single pass')
 parser.add_argument('--seed', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
-parser.add_argument('--log-interval', type=int, default=100, metavar='N',
+parser.add_argument('--log-interval', type=int, default=500, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--save-model', action='store_true', default=False,
                     help='For Saving the current Model')
@@ -120,26 +128,19 @@ parser.add_argument('--num-workers', type=int, default=0,
                     help='Number of workers for parallelization')
 args = parser.parse_args()
 use_cuda = not args.no_cuda and torch.cuda.is_available()
+print("CUDA: ", torch.cuda.is_available())
 
 
-quick_run = True
-full_run = True
-debug_run = False
-if(quick_run):
+run = 2
+if(run == 0): #Quick run
     args.epochs = 1
     num_workers = 1
-if(full_run):
-    args.epochs = 10
-    num_workers = 2
-if(debug_run):
+elif(run == 1): #Debug run
     args.epochs = 1
     num_workers = 0
-
-datatype = 0
-if(datatype == 0): #Single add or mult
-    data_name = "add_mult_single"
-else: # Both add_mult and mult_add
-    data_name = "add_mult"
+else: #Full Run
+    args.epochs = 10
+    num_workers = 1
 
 # torch.manual_seed(args.seed)
 
@@ -160,11 +161,18 @@ transform=transforms.Compose([
     transforms.Normalize((0.1307,), (0.3081,))
     ])
 
+datatype = 1
+if(datatype == 0): #Single add or mult
+    data_name = "add_mult_single"
+else: # Both add_mult and mult_add
+    data_name = "add_mult"
+
 mult_add = np.load(data_name + "_data.npy")
 mult_add_labels = np.load(data_name + "_labels.npy")
 input_output_shape = [mult_add.shape[1], mult_add_labels.shape[1]]
 mult_add = torch.Tensor(mult_add)
 mult_add_labels = torch.Tensor(mult_add_labels)
+
 
 train_dataset, test_dataset = train_test_dataset_maker(mult_add, mult_add_labels, test_percent = 0.3)
 train_loader = torch.utils.data.DataLoader(train_dataset,**train_kwargs)
@@ -174,10 +182,10 @@ nn_size = 400
 model = nn.Sequential(
     # GumbalMask(input_output_shape[0]),
     nn.Linear(input_output_shape[0], nn_size),
-    GaussianNoise(nn_size),
+    GumbalMask(nn_size),
     nn.ReLU(),
     nn.Linear(nn_size, nn_size),
-    GaussianNoise(nn_size),
+    GumbalMask(nn_size),
     nn.ReLU(),
     nn.Linear(nn_size, input_output_shape[1]),
     # GumbalMask(input_output_shape[1])
@@ -190,15 +198,17 @@ print_variance(model)
 optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
 train_test(args, optimizer, model, train_loader, test_loader)
-precision_original = precision_parameter_to_list(model)
+precision_original = precision_parameter_to_list(model, parameter_name="logits")
+print("Original Training\n=====================================\n")
+print_examples(model, test_loader)
 
 # Set gradient False for all layers (except GN)
 for name, param in model.named_parameters():
-    if "precisionlog" not in name:
+    if "logits" not in name:
         param.requires_grad = False
 
 # Create subset datasets
-# add_mult - first hmult_add_only_labelsalf
+# add_mult - first half
 # mult_add - second half
 half_index = mult_add.shape[0]//2
 add_mult_only = mult_add[:half_index,:]
@@ -206,14 +216,6 @@ mult_add_only = mult_add[half_index:, :]
 
 add_mult_only_labels = mult_add_labels[:half_index]
 mult_add_only_labels = mult_add_labels[half_index:]
-
-#Make copy of model to test if the deepcopy effects things?
-#After run, check the requires_grad flag on both model and original_model
-#Get prediction loss on sub-datasets
-#Currently, they are still performing well on both subsets
-#Why is it slow? Cause the computer just came on?
-
-#TODO: Convert test loss into meaningful l1 distance of each example on average
 
 #Create data_loaders
 train_dataset_mult_add, test_dataset_mult_add = train_test_dataset_maker(mult_add_only, mult_add_only_labels, test_percent = 0.3)
@@ -226,46 +228,62 @@ test_loader_add_mult = torch.utils.data.DataLoader(test_dataset_add_mult, **test
 
 #Create deep copy of model
 original_model = deepcopy(model)
-print("Original Examples")
-print_examples(model, test_loader)
 
+#Reset optimizer learning rate
 optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
 #Train add_mult
 train_test(args, optimizer, model, train_loader_add_mult, test_loader_add_mult)
-precision_add_mult = precision_parameter_to_list(model)
-print("Add-Mult should be low")
+precision_add_mult = precision_parameter_to_list(model, parameter_name="logits")
+print("Only add_mult: 0 , 1 should do well")
 print_examples(model, test_loader)
+print("Add_Mult should be lower loss")
 print("Mult_add Loss: ")
 test(model, test_loader_mult_add)
 print("Add_Mult Loss")
 test(model, test_loader_add_mult)
+
 
 #Re-point optimzer to the original_model
 optimizer = optim.Adadelta(original_model.parameters(), lr=args.lr)
 
 #Train mult_add
 train_test(args, optimizer, original_model, train_loader_mult_add, test_loader_mult_add)
-precision_mult_add = precision_parameter_to_list(original_model)
-print("Mult_add should be low")
+precision_mult_add = precision_parameter_to_list(original_model, parameter_name="logits")
+print("Only mult: 1 , 0 should do well")
 print_examples(original_model, test_loader)
+print("Mult_Add should be lower loss")
 print("Mult_add Loss: ")
 test(original_model, test_loader_mult_add)
 print("Add_Mult Loss")
 test(original_model, test_loader_add_mult)
+
 
 if args.save_model:
     torch.save(model.state_dict(), "mnist_cnn.pt")
 
 m = deepcopy(precision_original)
 a = deepcopy(precision_original)
+print("Masks - Original")
 for x in range(2):
     m[x] = precision_mult_add[x] - precision_original[x]
     a[x] = precision_add_mult[x] - precision_original[x]
+    average_weights_shared = 0
+    #Loop N times since we're sampling from a distribution
+    N = 100
+    for _ in range(N):
+        average_weights_shared += torch.count_nonzero(gumbal(m[x]) == gumbal(m[x])) / precision_mult_add[x].shape[0]
+    average_weights_shared = average_weights_shared / N
+    print("Layer ", x, ": ", average_weights_shared, "% shared")
     # plt.figure(x)
     # plt.scatter(m[x], a[x])
     # plt.title("Layer " + str(x))
 
+print("Just masks themselves")
+print("Layer |   Add %    |   Mult %  |   Add_size  |   Mult_size  | Original_size")
+
+fig = plt.figure()
+plt.title("Single Add Mult")
 for x in range(2):
     average_weights_shared_add = 0
     average_weights_shared_mult = 0
@@ -288,8 +306,8 @@ for x in range(2):
             cmap = colors.ListedColormap(['black', 'blue', 'red', 'purple'])
             bounds = [0, 1, 2,3,4]
             norm = colors.BoundaryNorm(bounds, cmap.N)
-            plt.figure(x)
-            im = plt.imshow(encoding, cmap=cmap, norm=norm, aspect = 60)
+            plt.subplot(2,1,x+1)
+            im = plt.imshow(encoding, cmap=cmap, norm=norm, aspect = 100)
             plt.title("Layer " + str(x+1))
             plt.xlabel("Neuron")
             plt.ylabel("Similarity")
@@ -312,4 +330,5 @@ for x in range(2):
     average_add_size = average_add_size / N
     average_mult_size = average_mult_size / N
     average_original_size = average_original_size / N
-    print(x, " , ", average_weights_shared_add, ", ", average_weights_shared_mult, ", ", average_add_size, " | ", average_mult_size, " , ", average_original_size)
+    print(x, " , ", average_weights_shared_add, ", ", average_weights_shared_mult, ", ", average_add_size, " , ", average_mult_size, " , ", average_original_size)
+
