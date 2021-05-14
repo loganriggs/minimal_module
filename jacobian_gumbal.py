@@ -14,8 +14,25 @@ from GumbalMaskWeights import GumbalMaskWeights
 from mask_zero_one import gumbal
 from torch.nn import functional as F
 from matplotlib import colors
+from functools import partial
 
 
+def get_activations(network, x):
+    activations = []
+    hooks = []
+    for name, m in network.named_modules():
+        if isinstance(m, nn.Linear):
+            save_activations = lambda mod, inp, out: activations.append(out)
+            hooks.append(m.register_forward_hook(save_activations))
+
+    network(x)
+    for h in hooks:
+        h.remove()
+
+    return torch.hstack(activations)
+
+#6 -> 1000 -> 2
+#3 -> 1000 -> 1
 
 class GumbalWeightMask(nn.Module):
     def __init__(self, shape):
@@ -43,21 +60,79 @@ def modify_parameters(mask, model):
 def get_parameters(model):
     return torch.cat(list(model.parameters()))
 
-def train(args, model, train_loader, optimizer, epoch):
+
+def compute_adjacency_matrix(embedding):
+    '''Compute correlation based adjacency matrix from embedding.'''
+    centered_embedding = embedding - embedding.mean()
+    centered_embedding = centered_embedding / centered_embedding.abs().mean()
+    cov = centered_embedding @ centered_embedding.T
+    inv_std = 1 / cov.diag().sqrt()
+    corr = cov * inv_std * inv_std.unsqueeze(1)
+    adj_mat = corr ** 2
+    return adj_mat
+
+
+def compute_laplacian(embedding):
+    '''Computes normalized Laplacian from embedding.
+
+    Parameters:
+        embedding (Tensor): n_neurons × n_features
+
+    Returns:
+        lap (Tensor): n_neurons × n_neurons
+    '''
+    # Compute adjacency matrix
+    adj_mat = compute_adjacency_matrix(embedding)
+
+    # Compute normalized laplacian
+    inv_sqrt_degree = 1 / adj_mat.sum(0, keepdims=True).sqrt()
+    adjnorm = adj_mat * inv_sqrt_degree * inv_sqrt_degree.T
+    lap = torch.eye(adjnorm.shape[0]).to(device) - adjnorm
+
+    return lap
+
+def train(args, model, train_loader, optimizer, epoch, mask_training = False):
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
         optimizer.zero_grad()
         output = model(data)
         loss = nn.L1Loss()(output, target)
+        original_loss = loss.detach().cpu()
         alpha = 0.001
-        loss += alpha * sum([weights_layer.exp().sum()
+        mask_loss =  alpha * sum([weights_layer.exp().sum()
                      for name, weights_layer in model.named_parameters() if "logits" in name])
+        loss += mask_loss
+        #Jacobian
+        batch_actloss = 0.0
+        if(not mask_training):
+            jacs = [torch.autograd.functional.jacobian(partial(get_activations, model), x) for x in data]
+            jac = torch.cat(jacs, dim=1).to(device)
+
+            # jac = jac.flatten(1)
+            #(64, 1, 64, 3) --> (64, 192)
+            #Q: why flatten from 4->2 dim?
+            lap = compute_laplacian(jac)
+            eigval, eigvec = torch.symeig(lap, eigenvectors=True)
+            #Q: Is the Poisson prior below the # of k clusters?
+            n_clusters = 2
+            eigval = eigval[n_clusters-1]
+            actloss = eigval
+            if(actloss < 0 ):
+                print("Eigenvalues: ", eigval < 0)
+            assert torch.allclose(eigval, eigval.sort(descending=False)[0]), "Eigenvalues not in ascending order."
+            # assert (torch.diff(eigval) > 1e-7).all(), "Non-distinct eigenvalues."
+            #Q: I kept getting this error. What's the bad possibility here of them being equal within a precision?
+
+            #Q: I made this loss way bigger, but that's because it's much tinier than others.
+            alpha_jacobian = 100
+            batch_actloss = alpha_jacobian*actloss.detach().cpu()
+            loss += alpha_jacobian * actloss
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.3f} | Mask_loss {:.3f} | jac_loss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader), loss.item() / len(target)))
+                100. * batch_idx / len(train_loader), original_loss, mask_loss, batch_actloss))
             if args.dry_run:
                 break
 
@@ -100,11 +175,11 @@ def precision_parameter_to_list(model):
     return precision_list
 
 
-def train_test(args, optimizer, model, train_loader, test_loader):
+def train_test(args, optimizer, model, train_loader, test_loader, mask_training = False):
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
 
     for epoch in range(1, args.epochs + 1):
-        train(args, model, train_loader, optimizer, epoch)
+        train(args, model, train_loader, optimizer, epoch, mask_training= mask_training)
         test(model, test_loader)
         scheduler.step()
 
@@ -132,7 +207,7 @@ parser.add_argument('--dry-run', action='store_true', default=False,
                     help='quickly check a single pass')
 parser.add_argument('--seed', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
-parser.add_argument('--log-interval', type=int, default=500, metavar='N',
+parser.add_argument('--log-interval', type=int, default=200, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--save-model', action='store_true', default=False,
                     help='For Saving the current Model')
@@ -142,22 +217,23 @@ args = parser.parse_args()
 use_cuda = not args.no_cuda and torch.cuda.is_available()
 
 
-run = 2
+run = 1
 if(run == 0): #Quick run
     args.epochs = 1
-    num_workers = 1
+    num_workers = 2
 elif(run == 1): #Debug run
     args.epochs = 1
     num_workers = 0
 else: #Full Run
-    args.epochs = 10
-    num_workers = 1
+    args.epochs = 6
+    num_workers = 2
 
 # torch.manual_seed(args.seed)
-
 device = torch.cuda if use_cuda else torch
+device = "cuda" if use_cuda else "cpu"
 # torch.set_default_tensor_type(device.FloatTensor)
 print("cuda = ", device)
+args.device = device
 
 train_kwargs = {'batch_size': args.batch_size}
 test_kwargs = {'batch_size': args.test_batch_size}
@@ -174,7 +250,7 @@ transform=transforms.Compose([
 
 
 loss_results = np.zeros(6)
-datatype = 0
+datatype = 1
 if(datatype == 0): #Single add or mult
     data_name = "add_mult_single"
     labels = ["Single Experiment", "Add", "Mult"]
@@ -186,8 +262,8 @@ else: # Both add_mult and mult_add
 mult_add = np.load(data_name + "_data.npy")
 mult_add_labels = np.load(data_name + "_labels.npy")
 input_output_shape = [mult_add.shape[1], mult_add_labels.shape[1]]
-mult_add = torch.Tensor(mult_add)
-mult_add_labels = torch.Tensor(mult_add_labels)
+mult_add = torch.Tensor(mult_add).to(device)
+mult_add_labels = torch.Tensor(mult_add_labels).to(device)
 
 
 train_dataset, test_dataset = train_test_dataset_maker(mult_add, mult_add_labels, test_percent = 0.3)
@@ -196,7 +272,7 @@ test_loader  = torch.utils.data.DataLoader(test_dataset, **test_kwargs)
 
 
 networkShape = [input_output_shape[0], 1000, input_output_shape[1]]
-model = GumbalWeightMask(networkShape)
+model = GumbalWeightMask(networkShape).to(device)
 
 
 print("Beginning\n=================================")
@@ -245,7 +321,7 @@ loss_results[1] = test(model, test_loader_add_mult)
 optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
 #Train add_mult
-train_test(args, optimizer, model, train_loader_add_mult, test_loader_add_mult)
+train_test(args, optimizer, model, train_loader_add_mult, test_loader_add_mult, mask_training=True)
 precision_add_mult = precision_parameter_to_list(model)
 print("Only add_mult: 0 , 1 should do well")
 print_examples(model, test_loader)
@@ -260,7 +336,7 @@ loss_results[3] = test(model, test_loader_add_mult)
 optimizer_new = optim.Adadelta(original_model.parameters(), lr=args.lr)
 
 #Train mult_add
-train_test(args, optimizer_new, original_model, train_loader_mult_add, test_loader_mult_add)
+train_test(args, optimizer_new, original_model, train_loader_mult_add, test_loader_mult_add, mask_training=True)
 precision_mult_add = precision_parameter_to_list(original_model)
 print("Only mult: 1 , 0 should do well")
 print_examples(original_model, test_loader)
