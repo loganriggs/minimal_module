@@ -34,21 +34,6 @@ def get_activations(network, x):
 #6 -> 1000 -> 2
 #3 -> 1000 -> 1
 
-class GumbalWeightMask(nn.Module):
-    def __init__(self, shape):
-        super().__init__()
-        self.fc1 = GumbalMaskWeights(shape[0], shape[1])
-        self.fc2 = GumbalMaskWeights(shape[1], shape[1])
-        self.fc3 = GumbalMaskWeights(shape[1], shape[2])
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = F.relu(x)
-        x = self.fc2(x)
-        x = F.relu(x)
-        output = self.fc3(x)
-        return output
-
 def modify_parameters(mask, model):
     index = 0
     for _, v in model.parameters():
@@ -261,7 +246,6 @@ else: # Both add_mult and mult_add
 
 mult_add = np.load(data_name + "_data.npy")
 mult_add_labels = np.load(data_name + "_labels.npy")
-input_output_shape = [mult_add.shape[1], mult_add_labels.shape[1]]
 mult_add = torch.Tensor(mult_add).to(device)
 mult_add_labels = torch.Tensor(mult_add_labels).to(device)
 
@@ -271,8 +255,13 @@ train_loader = torch.utils.data.DataLoader(train_dataset,**train_kwargs)
 test_loader  = torch.utils.data.DataLoader(test_dataset, **test_kwargs)
 
 
-networkShape = [input_output_shape[0], 1000, input_output_shape[1]]
-model = GumbalWeightMask(networkShape).to(device)
+model = nn.Sequential(
+    GumbalMaskWeights(mult_add.shape[1], 1000),
+    nn.ReLU(),
+    GumbalMaskWeights(1000, 1000),
+    nn.ReLU(),
+    GumbalMaskWeights(1000, mult_add_labels.shape[1]),
+    ).to(device)
 
 
 print("Beginning\n=================================")
@@ -372,58 +361,19 @@ for name, _ in model.named_parameters():
 
 
 for layer_index in range(num_of_layers):
-    average_weights_shared_add = 0
-    average_weights_shared_mult = 0
-    average_add_size = 0
-    average_mult_size = 0
-    average_original_size = 0
-    #Loop N times since we're sampling from a distribution
-    N = 100
-    for n in range(N):
-        add_mask = gumbal(precision_add_mult[layer_index])
-        mult_mask = gumbal(precision_mult_add[layer_index])
-        add_size = torch.count_nonzero(add_mask)
-        mult_size = torch.count_nonzero(mult_mask)
-        shared_size = torch.count_nonzero(add_mask*mult_mask)
-        # if n == 0: #plot first mask
-        #     encoding = add_mask + 2*mult_mask
-        #     if(encoding.shape.__len__() == 1):
-        #         encoding = encoding[None, :] #Extend dimension
-        #     cmap = colors.ListedColormap(['black', 'blue', 'red', 'purple'])
-        #     bounds = [0, 1, 2,3,4]
-        #     norm = colors.BoundaryNorm(bounds, cmap.N)
-        #     plt.figure(x)
-        #     if x % 2 != 0: #odd is bias layer
-        #         aspect_size = 100
-        #     elif x == 0:
-        #         aspect_size = 5
-        #     elif x == 2:
-        #         aspect_size = 1
-        #     else:
-        #         aspect_size = 10
-        #     im = plt.imshow(encoding, cmap=cmap, norm=norm, aspect = aspect_size)
-        #     plt.title("Layer " + str(x+1))
-        #     plt.xlabel("Neuron")
-        #     plt.ylabel("Similarity")
-        #     im.axes.set_yticks([])
-
-            #11 = shared (purple)
-            #10 = add_mask only (red)
-            #01 = mult_mask only (blue)
-            #00 = not used by either (black)
-
-        average_add_size += add_size
-        average_mult_size += mult_size
-        average_original_size += torch.count_nonzero(gumbal(precision_original[layer_index]))
-        if(add_size != 0):
-            average_weights_shared_add += shared_size / add_size
-        if(mult_size != 0):
-            average_weights_shared_mult += shared_size / mult_size
-    average_weights_shared_add = average_weights_shared_add / N
-    average_weights_shared_mult = average_weights_shared_mult / N
-    average_add_size = average_add_size / N
-    average_mult_size = average_mult_size / N
-    average_original_size = average_original_size / N
+    #Loop 100 times since we're sampling from a distribution
+    add_mask      = torch.stack([gumbal(precision_add_mult[layer_index]) for _ in 100])
+    mult_mask     = torch.stack([gumbal(precision_mult_add[layer_index]) for _ in 100])
+    original_mask = torch.stack([gumbal(precision_original[layer_index]) for _ in 100])
+    add_size      = torch.count_nonzero(add_mask          , dim=(1,2))
+    mult_size     = torch.count_nonzero(mult_mask         , dim=(1,2))
+    shared_size   = torch.count_nonzero(add_mask*mult_mask, dim=(1,2))
+    original_size = torch.count_nonzero(original_size     , dim=(1,2))
+    average_add_size            = add_size.mean(0)
+    average_mult_size           = mult_size.mean(0)
+    average_original_size       = original_size.mean(0)
+    average_weights_shared_add  = (shared_size / add_size).nan_to_num().mean(0)
+    average_weights_shared_mult = (shared_size / mult_size).nan_to_num().mean(0)
     print(layer_index, " , ", average_weights_shared_add, ", ", average_weights_shared_mult, ", ", average_add_size, " , ", average_mult_size, " , ", average_original_size)
     weights_shared_add[layer_index] = average_weights_shared_add
     weights_shared_mult[layer_index] = average_weights_shared_mult
