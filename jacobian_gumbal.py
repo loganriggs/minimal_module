@@ -34,21 +34,6 @@ def get_activations(network, x):
 #6 -> 1000 -> 2
 #3 -> 1000 -> 1
 
-class GumbalWeightMask(nn.Module):
-    def __init__(self, shape):
-        super().__init__()
-        self.fc1 = GumbalMaskWeights(shape[0], shape[1])
-        self.fc2 = GumbalMaskWeights(shape[1], shape[1])
-        self.fc3 = GumbalMaskWeights(shape[1], shape[2])
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = F.relu(x)
-        x = self.fc2(x)
-        x = F.relu(x)
-        output = self.fc3(x)
-        return output
-
 def modify_parameters(mask, model):
     index = 0
     for _, v in model.parameters():
@@ -261,7 +246,6 @@ else: # Both add_mult and mult_add
 
 mult_add = np.load(data_name + "_data.npy")
 mult_add_labels = np.load(data_name + "_labels.npy")
-input_output_shape = [mult_add.shape[1], mult_add_labels.shape[1]]
 mult_add = torch.Tensor(mult_add).to(device)
 mult_add_labels = torch.Tensor(mult_add_labels).to(device)
 
@@ -271,8 +255,13 @@ train_loader = torch.utils.data.DataLoader(train_dataset,**train_kwargs)
 test_loader  = torch.utils.data.DataLoader(test_dataset, **test_kwargs)
 
 
-networkShape = [input_output_shape[0], 1000, input_output_shape[1]]
-model = GumbalWeightMask(networkShape).to(device)
+model = nn.Sequential(
+    GumbalMaskWeights(mult_add.shape[1], 1000),
+    nn.ReLU(),
+    GumbalMaskWeights(1000, 1000),
+    nn.ReLU(),
+    GumbalMaskWeights(1000, mult_add_labels.shape[1]),
+    ).to(device)
 
 
 print("Beginning\n=================================")
